@@ -1,13 +1,103 @@
-# Build a parcel-year to HLS tile map for California agricultural parcels (LandIQ v4.1).
-# Reads crops_all_years.parquet filtered by agricultural CLASS/SUBCLASS, loads parcel
-# geometries, intersects with the HLS tile grid, and writes RDS plus tile parcel counts.
-#
-# Main inputs: CCMMF_LANDIQ_V4 (LandIQ root), CCMMF_MANAGEMENT (crop lookup, tile extent),
-#   optional CLI year_min year_max overwrite.
-# Main outputs: hls_parcel_tile_map_v4.1_years=MIN-MAX.rds, hls_tile_parcel_counts CSV,
-#   optional removed parcel-years CSV when geometries fail QC.
-# How to run: Rscript scripts/hls/build_hls_parcel_tile_map.R [year_min] [year_max] [overwrite]
-# Workflow: upstream of tilewise MSLSP/NDTI drivers; run build_hls_tile_extent.R first.
+#' Build parcel-year to HLS tile map
+#'
+#' Identifies which agricultural LandIQ parcels intersect each HLS tile for a
+#' requested year range. The script reads LandIQ crop records, filters to
+#' agricultural class-subclass combinations using the crop-code lookup table,
+#' loads matching parcel geometries in chunks, intersects parcel polygons with
+#' pre-built HLS tile extents, and writes parcel-to-tile and tile-to-parcel-count
+#' outputs.
+#'
+#' This script should be run after `build_hls_tile_extent.R`, which creates
+#' `hls_tile_extent.rds`.
+#'
+#' @section Usage:
+#' ```sh
+#' Rscript build_hls_parcel_tile_map.R [year_min] [year_max] [overwrite]
+#' ```
+#'
+#' @section Arguments:
+#' \describe{
+#'   \item{year_min}{Optional integer. First year to include. Defaults to `2016`.}
+#'   \item{year_max}{Optional integer. Last year to include. Defaults to `2024`.}
+#'   \item{overwrite}{Optional logical-like value. If `"overwrite"`, `"true"`,
+#'   `"t"`, `"1"`, `"yes"`, or `"y"`, existing outputs are replaced.}
+#' }
+#'
+#' @section Environment variables:
+#' \describe{
+#'   \item{CCMMF_LANDIQ_V4}{Base directory for LandIQ v4.1 harmonized inputs.
+#'   Defaults to `/projectnb/dietzelab/ccmmf/LandIQ-harmonized-v4.1`.}
+#'   \item{CCMMF_MANAGEMENT}{Management directory containing lookup tables,
+#'   tile extents, and script outputs. Defaults to
+#'   `/projectnb/dietzelab/ccmmf/management`.}
+#' }
+#'
+#' @section Inputs:
+#' \describe{
+#'   \item{parcels-consolidated.gpkg}{Parcel geometry layer from LandIQ v4.1.}
+#'   \item{crops_all_years.parq}{Parcel-year crop records from LandIQ v4.1.}
+#'   \item{LandIQ_cropCode_lookup_table.csv}{Crop-code lookup table used to keep
+#'   agricultural `CLASS` and `SUBCLASS` combinations.}
+#'   \item{hls_tile_extent.rds}{Pre-built HLS tile extent object created by
+#'   `build_hls_tile_extent.R`.}
+#' }
+#'
+#' @section Outputs:
+#' \describe{
+#'   \item{hls_parcel_tile_map_v4.1_years=<min>-<max>.rds}{RDS file containing
+#'   parcel-year rows with intersecting HLS tile IDs and tile counts.}
+#'   \item{hls_tile_parcel_counts_v4.1_years=<min>-<max>.csv}{CSV file giving
+#'   the number of parcel-year records per HLS tile and year.}
+#'   \item{hls_parcel_tile_map_removed_v4.1_years=<min>-<max>.csv}{Optional CSV
+#'   written only when parcel-years are dropped because of invalid or corrupt
+#'   geometries.}
+#' }
+#'
+#' @section Output columns:
+#' The parcel-tile RDS contains:
+#' \describe{
+#'   \item{parcel_id}{LandIQ parcel identifier.}
+#'   \item{year}{Crop year.}
+#'   \item{tileIDs}{Comma-separated HLS tile IDs intersecting the parcel.}
+#'   \item{n_tiles}{Number of intersecting HLS tiles.}
+#' }
+#'
+#' The tile-count CSV contains:
+#' \describe{
+#'   \item{tile_id}{HLS tile identifier.}
+#'   \item{year}{Crop year.}
+#'   \item{n_parcels}{Number of parcel-year records intersecting the tile.}
+#' }
+#'
+#' @details
+#' Agricultural filtering is done by joining `CLASS` and `SUBCLASS` against the
+#' LandIQ crop-code lookup table. This preserves subclass-level differences in
+#' crop grouping and PFT assignment.
+#'
+#' Parcel geometries are read in chunks to avoid very large SQL `IN` queries.
+#' Empty, invalid, or corrupt geometries are dropped and optionally logged. If
+#' bulk geometry checks, reprojection, or spatial intersection fail, the script
+#' falls back to row-by-row checks to keep usable parcels.
+#'
+#' A parcel is assigned to every HLS tile polygon it intersects; any overlap
+#' counts.
+#'
+#' @examples
+#' \dontrun{
+#' # Default years, no overwrite
+#' Rscript build_hls_parcel_tile_map.R
+#'
+#' # Specific year range
+#' Rscript build_hls_parcel_tile_map.R 2018 2023
+#'
+#' # Force overwrite
+#' Rscript build_hls_parcel_tile_map.R 2018 2023 overwrite
+#' }
+#'
+#' @seealso build_hls_tile_extent.R
+#'
+#' @keywords internal
+NULL
 
 suppressPackageStartupMessages({
   library(sf)
@@ -17,19 +107,17 @@ suppressPackageStartupMessages({
 })
 sf::sf_use_s2(FALSE)
 
-#### Configuration
-
-path_landiq_v4 <- Sys.getenv("CCMMF_LANDIQ_V4", "/projectnb/dietzelab/ccmmf/LandIQ-harmonized-v4.1")
-path_management <- Sys.getenv("CCMMF_MANAGEMENT", "/projectnb/dietzelab/ccmmf/management")
-path_parcels <- file.path(path_landiq_v4, "parcels-consolidated.gpkg")
-path_crops_parq <- file.path(path_landiq_v4, "crops_all_years.parq")
+# --- Configuration ---
+path_landiq_v4     <- Sys.getenv("CCMMF_LANDIQ_V4", "/projectnb/dietzelab/ccmmf/LandIQ-harmonized-v4.1")
+path_management    <- Sys.getenv("CCMMF_MANAGEMENT", "/projectnb/dietzelab/ccmmf/management")
+path_parcels      <- file.path(path_landiq_v4, "parcels-consolidated.gpkg")
+path_crops_parq   <- file.path(path_landiq_v4, "crops_all_years.parq")
 path_cropcode_lookup <- file.path(path_management, "LandIQ_cropCode_lookup_table.csv")
-path_tiles <- file.path(path_management, "hls_tile_extent.rds")
-path_out <- path_management
+path_tiles        <- file.path(path_management, "hls_tile_extent.rds")
+path_out          <- path_management
 
-#### Parse arguments
-
-args <- commandArgs(trailingOnly = TRUE)
+# --- Parse args ---
+args    <- commandArgs(trailingOnly = TRUE)
 year_min <- if (length(args) >= 1) as.integer(args[1]) else 2016L
 year_max <- if (length(args) >= 2) as.integer(args[2]) else 2024L
 overwrite <- length(args) >= 3 && tolower(args[3]) %in% c("overwrite", "true", "t", "1", "yes", "y")
@@ -40,15 +128,14 @@ if (!file.exists(path_tiles)) {
   stop("Tile extent not found. Run: Rscript scripts/hls/build_hls_tile_extent.R")
 }
 
-tile_prep <- readRDS(path_tiles)
+tile_prep   <- readRDS(path_tiles)
 tile_extent <- tile_prep$tile_extent_sf
-used_crs <- tile_prep$used_crs
+used_crs   <- tile_prep$used_crs
 
-#### Parcel-year rows (agricultural only via CLASS and SUBCLASS join)
-
-# Join on CLASS+SUBCLASS so subclass-level PFT differences (e.g. T19 vs T28 woody) stay correct.
-lookup <- fread(path_cropcode_lookup)
-ag_pairs <- unique(lookup[is_agricultural == TRUE,
+# --- Parcel-year rows: agricultural only via (CLASS, SUBCLASS) join ---
+# Join on CLASS+SUBCLASS so subclass-level PFT differences (e.g. T19 vs T28 woody) are correct.
+lookup         <- fread(path_cropcode_lookup)
+ag_pairs       <- unique(lookup[is_agricultural == TRUE,
   .(CLASS = trimws(CLASS), SUBCLASS = as.character(SUBCLASS))])
 ag_classes_filter <- unique(ag_pairs$CLASS)
 
@@ -57,7 +144,7 @@ parcel_year_raw <- arrow::open_dataset(path_crops_parq) |>
   dplyr::select(parcel_id, year, CLASS, SUBCLASS) |>
   dplyr::collect() |>
   as.data.table()
-parcel_year_raw[, CLASS := trimws(as.character(CLASS))]
+parcel_year_raw[, CLASS    := trimws(as.character(CLASS))]
 parcel_year_raw[, SUBCLASS := as.character(SUBCLASS)]
 parcel_year <- merge(parcel_year_raw, ag_pairs, by = c("CLASS", "SUBCLASS"))[
   , .(parcel_id = as.character(parcel_id), year = as.integer(year))
@@ -66,21 +153,19 @@ parcel_year[, parcel_id := as.character(parcel_id)]
 parcel_year[, year := as.integer(year)]
 message("Parcel-year rows (agricultural, ", year_min, "-", year_max, "): ", nrow(parcel_year))
 
-#### Load parcel geometry in chunks (avoid huge SQL IN lists)
-
-ids <- unique(parcel_year$parcel_id)
+# --- Load parcel geometry in chunks (avoid huge SQL IN) ---
+ids   <- unique(parcel_year$parcel_id)
 layer <- st_layers(path_parcels)$name[1]
 chunks <- split(ids, ceiling(seq_along(ids) / 5000L))
 geom_chunks <- lapply(chunks, function(x) {
   esc <- gsub("'", "''", x, fixed = TRUE)
-  q <- sprintf('SELECT * FROM "%s" WHERE parcel_id IN (%s)', layer, paste0("'", esc, "'", collapse = ","))
+  q   <- sprintf('SELECT * FROM "%s" WHERE parcel_id IN (%s)', layer, paste0("'", esc, "'", collapse = ","))
   st_read(path_parcels, query = q, quiet = TRUE)
 })
 parcels <- do.call(rbind, geom_chunks)
 parcels$parcel_id <- as.character(parcels$parcel_id)
 
-#### QC: drop invalid or empty geometries (bad WKB can break OGR)
-
+# --- QC: drop invalid/empty geometries (corrupt WKB can cause OGR errors) ---
 valid <- tryCatch(
   !sf::st_is_empty(sf::st_geometry(parcels)),
   error = function(e) {
@@ -97,8 +182,7 @@ removed_log <- if (any(!valid)) {
 }
 parcels <- parcels[valid, ]
 
-#### Reproject to tile CRS (row-by-row fallback if bulk transform fails)
-
+# --- Reproject to tile CRS; fallback to row-by-row if bulk transform fails ---
 parcels_tr <- tryCatch(sf::st_transform(parcels, used_crs), error = function(e) NULL)
 if (is.null(parcels_tr)) {
   message("Bulk st_transform failed; checking row-by-row.")
@@ -129,8 +213,7 @@ if (is.null(parcels_tr)) {
   parcels <- parcels_tr
 }
 
-#### Spatial join: parcel polygon intersects tile polygon (any overlap counts)
-
+# --- Spatial join: parcel polygon intersects tile polygon (any overlap counts) ---
 hits <- tryCatch(sf::st_intersects(parcels, tile_extent), error = function(e) NULL)
 if (is.null(hits)) {
   message("Bulk st_intersects failed; checking row-by-row.")
@@ -162,25 +245,22 @@ if (nrow(removed_log) > 0) {
   message("Dropped ", nrow(removed_log), " parcel-years with invalid geometry; log: ", removed_log_file)
 }
 
-#### Build parcel to tiles table and join to parcel_year
-
+# --- Build parcel -> tiles table and join to parcel_year ---
 tile_by_parcel <- data.table(
   parcel_id = parcels$parcel_id,
-  tileIDs = vapply(hits, function(i) paste(tile_extent$tile_id[i], collapse = ","), character(1)),
-  n_tiles = lengths(hits)
+  tileIDs   = vapply(hits, function(i) paste(tile_extent$tile_id[i], collapse = ","), character(1)),
+  n_tiles   = lengths(hits)
 )
 setkey(tile_by_parcel, parcel_id)
 setkey(parcel_year, parcel_id)
 out <- tile_by_parcel[parcel_year, nomatch = 0][, .(parcel_id, year, tileIDs, n_tiles)]
 
-#### Tile to parcel counts (for scheduling)
-
-tile_long <- out[, .(tile_id = unlist(strsplit(tileIDs, ",", fixed = TRUE))), by = .(parcel_id, year)]
-tile_counts <- tile_long[, .(n_parcels = .N), by = .(tile_id, year)]
+# --- Tile -> parcel counts (for scheduling) ---
+tile_long    <- out[, .(tile_id = unlist(strsplit(tileIDs, ",", fixed = TRUE))), by = .(parcel_id, year)]
+tile_counts  <- tile_long[, .(n_parcels = .N), by = .(tile_id, year)]
 setorder(tile_counts, tile_id, year)
 
-#### Write outputs
-
+# --- Write ---
 dir.create(path_out, recursive = TRUE, showWarnings = FALSE)
 saveRDS(out, out_file)
 tile_counts_file <- file.path(path_out, sprintf("hls_tile_parcel_counts_v4.1_years=%d-%d.csv", year_min, year_max))
