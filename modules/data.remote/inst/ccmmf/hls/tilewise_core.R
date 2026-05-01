@@ -1,4 +1,4 @@
-#' Tilewise core workflow orchestration
+#' Tilewise core workflow orchestration 
 #'
 #' Shared framework for tile-based HLS workflows such as NDTI and MSLSP.
 #' Implements a four-step pipeline for extracting parcel-level values from HLS
