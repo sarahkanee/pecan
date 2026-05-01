@@ -1,10 +1,93 @@
-# Shared tilewise orchestration for HLS-derived products (MSLSP, NDTI).
-# Implements prep-static, per-tile extract to tilepieces, combine to Parquet, and optional merge.
-#
-# Main inputs: product object (see Product interface at bottom of file).
-# Main outputs: tilepiece CSV.gz dirs and product-specific Parquet paths.
-# How to run: sourced from tilewise_*_driver.R; not a standalone CLI.
-# Workflow: core of monitoring workflow stages S2, S5 for raster summaries.
+#' Tilewise core workflow orchestration
+#'
+#' Shared framework for tile-based HLS workflows such as NDTI and MSLSP.
+#' Implements a four-step pipeline for extracting parcel-level values from HLS
+#' products using HLS tile boundaries:
+#'
+#' 1. prep-static — load parcel IDs, parcel-tile mapping, and geometry
+#' 2. extract — process scenes tile-by-tile and write tilepieces (`.csv.gz`)
+#' 3. combine — aggregate tilepieces into per-parcel outputs
+#' 4. merge — concatenate combined parts into final output
+#'
+#' Product-specific behavior is injected through a `product` object that defines
+#' required methods such as `prep_static()`, `scene_index()`, and
+#' `process_scene()`.
+#'
+#' This script provides the generic orchestration layer used by multiple HLS
+#' workflows and handles logging, bucketed aggregation, tile-level timing, and
+#' output management.
+#'
+#' @section Main functions:
+#' \describe{
+#'   \item{tilewise_prep_static()}{Runs product-specific preparation of parcel
+#'   metadata and geometry.}
+#'   \item{tilewise_run()}{Processes HLS scenes tile-by-tile and writes tilepiece
+#'   outputs.}
+#'   \item{tilewise_combine()}{Aggregates tilepieces into parcel-level outputs
+#'   using either product-defined logic or the generic bucket workflow.}
+#'   \item{tilewise_merge()}{Concatenates bucket-level combined outputs into the
+#'   final product file.}
+#' }
+#'
+#' @section Logging:
+#' Logging uses timestamped console messages and optional file output via:
+#' \describe{
+#'   \item{tilewise_log_init()}{Starts log file output.}
+#'   \item{tilewise_log_close()}{Closes the active log file.}
+#'   \item{tw_log()}{Writes timestamped log messages.}
+#' }
+#'
+#' @section Product interface:
+#' Required product methods:
+#' \describe{
+#'   \item{prep_static(year, ...)}{Returns a list containing `year`, `polys`,
+#'   and `out_dir`.}
+#'   \item{scene_index(year, time_key, verbose)}{Returns scene metadata as a
+#'   `data.table`.}
+#'   \item{scene_index_tile_col}{Column name containing tile IDs in the scene
+#'   index table.}
+#'   \item{process_scene(prep, scene_row, tile_parcels, tile_id)}{Processes one
+#'   scene and returns extracted results.}
+#'   \item{path_tilepieces()}{Returns output directory for tilepieces.}
+#'   \item{path_final_output()}{Returns final output file path.}
+#'   \item{empty_tilepiece_schema()}{Returns a zero-row table with correct output
+#'   columns.}
+#' }
+#'
+#' Optional:
+#' \describe{
+#'   \item{prepare_tile()}{Loads tile-specific geometry or context before scene
+#'   processing.}
+#'   \item{combine()}{Custom full combine step that replaces the generic bucket
+#'   workflow.}
+#' }
+#'
+#' Additional methods required only when `combine()` is not defined:
+#' \describe{
+#'   \item{path_combine_parts()}
+#'   \item{validate_tilepiece()}
+#'   \item{prepare_for_scatter()}
+#'   \item{scatter_cols()}
+#'   \item{aggregate_bucket()}
+#'   \item{empty_part_schema()}
+#' }
+#'
+#' @details
+#' The generic combine workflow uses a bucket strategy so all rows for the same
+#' parcel are guaranteed to be processed together while keeping memory bounded.
+#' Rows are first scattered into hash buckets using parcel ID, then each bucket
+#' is aggregated independently.
+#'
+#' The extract step also records per-tile timing summaries (`_tile_timing.csv`)
+#' so slow or failed tiles can be identified easily.
+#'
+#' The environment variable `TILEWISE_ONE_TILE` can be used for smoke testing by
+#' restricting execution to a single tile.
+#'
+#' @seealso tilewise_run, tilewise_combine, tilewise_merge
+#'
+#' @keywords internal
+NULL
 
 suppressPackageStartupMessages({
   library(sf)
@@ -12,7 +95,7 @@ suppressPackageStartupMessages({
   library(stringr)
 })
 
-#### Logging
+# --- Logging ---
 # Timestamped log to console and optional file. Driver calls tilewise_log_init()
 # to enable file sink; tw_log() works console-only if not set.
 
@@ -50,7 +133,7 @@ tw_log <- function(level = "INFO", ...) {
   }
 }
 
-#### Generic helpers
+# --- Generic helpers ---
 
 parcel_id_to_bucket <- function(parcel_ids, n_buckets) {
   x <- suppressWarnings(as.integer(parcel_ids))
@@ -95,7 +178,7 @@ build_tile_to_parcel_indices <- function(polys) {
 
 sanitize_tile_id <- function(id) gsub("[^0-9A-Za-z]+", "_", id)
 
-#### tilewise_run (extract per tile and scene)
+# --- tilewise_run: extract per tile and scene ---
 
 tilewise_run <- function(prep, time_key, product, overwrite = FALSE, verbose = TRUE) {
   year     <- prep$year
@@ -171,13 +254,13 @@ tilewise_run <- function(prep, time_key, product, overwrite = FALSE, verbose = T
     start_ts    <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
     n_rows      <- 0L
 
-    # Scenes for this tile - fetched before geometry so prepare_tile can use CRS.
+    # Scenes for this tile — fetched before geometry so prepare_tile can use CRS.
     # Use cur_tile (not tile_id) so data.table doesn't match the column of same name.
     cur_tile <- tile_id
     scenes_this_tile <- scene_index_dt[get(tile_col) == cur_tile]
 
     if (nrow(scenes_this_tile) == 0) {
-      if (verbose) tw_log("INFO", "tile=", tile_id, " 0 scenes - writing empty tilepiece")
+      if (verbose) tw_log("INFO", "tile=", tile_id, " 0 scenes — writing empty tilepiece")
       write_empty_tilepiece(output_tmp, output_gz)
       timing_rows[[length(timing_rows) + 1]] <- list(
         tile_id = tile_id, n_parcels = length(parcel_indices), n_scenes = 0L,
@@ -201,7 +284,7 @@ tilewise_run <- function(prep, time_key, product, overwrite = FALSE, verbose = T
     }
 
     if (is.null(tile_parcels) || nrow(tile_parcels) == 0) {
-      if (verbose) tw_log("WARN", "tile=", tile_id, " no parcel geometry - writing empty tilepiece")
+      if (verbose) tw_log("WARN", "tile=", tile_id, " no parcel geometry — writing empty tilepiece")
       write_empty_tilepiece(output_tmp, output_gz)
       timing_rows[[length(timing_rows) + 1]] <- list(
         tile_id = tile_id, n_parcels = length(parcel_indices), n_scenes = nrow(scenes_this_tile),
@@ -272,7 +355,7 @@ tilewise_run <- function(prep, time_key, product, overwrite = FALSE, verbose = T
   invisible(tilepieces_dir)
 }
 
-#### tilewise_combine (aggregate tilepieces)
+# --- tilewise_combine: aggregate tilepieces into per-(parcel, time_key) rows ---
 
 tilewise_combine <- function(prep, time_key, product, n_buckets = 256L,
                              overwrite = FALSE, verbose = TRUE) {
@@ -285,7 +368,7 @@ tilewise_combine <- function(prep, time_key, product, n_buckets = 256L,
     return(product$combine(prep, time_key, overwrite = overwrite, verbose = verbose))
   }
 
-  #### Generic bucket combine (products without custom combine)
+  # ---- Generic bucket approach (kept for products without combine) ----
   tilepieces_dir <- product$path_tilepieces(prep$out_dir, year, time_key)
   parts_dir      <- product$path_combine_parts(prep$out_dir, year, time_key)
   tile_files     <- list.files(tilepieces_dir, "^tile=.*\\.csv(\\.gz)?$", full.names = TRUE)
@@ -345,7 +428,7 @@ tilewise_combine <- function(prep, time_key, product, n_buckets = 256L,
   invisible(parts_dir)
 }
 
-#### tilewise_merge (concatenate bucket parts)
+# --- tilewise_merge: concatenate bucket parts into final output ---
 
 tilewise_merge <- function(prep, time_key, product, overwrite = FALSE, verbose = TRUE) {
   year     <- prep$year
@@ -355,10 +438,10 @@ tilewise_merge <- function(prep, time_key, product, overwrite = FALSE, verbose =
   if (!is.null(product$combine)) {
     out_path <- product$path_final_output(prep$out_dir, year, time_key)
     if (file.exists(out_path)) {
-      if (verbose) message("[merge] skipped - combine already produced: ", out_path)
+      if (verbose) message("[merge] skipped — combine already produced: ", out_path)
       return(invisible(out_path))
     }
-    # Final output missing - run combine now.
+    # Final output missing — run combine now.
     if (verbose) message("[merge] final output missing, running combine")
     return(product$combine(prep, time_key, overwrite = overwrite, verbose = verbose))
   }
@@ -381,7 +464,7 @@ tilewise_prep_static <- function(year, product, ...) {
   product$prep_static(year, ...)
 }
 
-#### Product interface
+# --- Product interface ---
 # Required:
 #   product$prep_static(year, ...)
 #     -> list(year, polys, out_dir)
